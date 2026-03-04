@@ -11,4 +11,7 @@ wheels/
 
 history/*
 scratch/*
+logs/*
 .env
+.agent-launch.sh
+.agent.pid

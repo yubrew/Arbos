@@ -111,7 +111,7 @@ pkg_install() {
 
 printf "  ${BOLD}Installing prerequisites${NC}\n\n"
 
-for cmd in git python3 curl tmux vim; do
+for cmd in git python3 curl vim; do
     if command_exists "$cmd"; then
         ok "$cmd"
     else
@@ -205,6 +205,9 @@ printf "\n"
 
 printf "  ${BOLD}Configuration${NC}\n\n"
 
+printf "  ${DIM}Include CURSOR_API_KEY for headless agent auth${NC}\n"
+printf "  ${DIM}(get one at https://cursor.com/settings → API Keys)${NC}\n\n"
+
 if [ "$HAS_TTY" = true ]; then
     printf "  ${DIM}Paste your environment variables (KEY=VALUE, one per line)${NC}\n"
     printf "  ${DIM}Press Enter on an empty line when done${NC}\n\n"
@@ -234,51 +237,70 @@ fi
 
 printf "\n"
 
-# ── 7. Start agent in tmux ───────────────────────────────────────────────────
-
-SESSION="agent"
+# ── 7. Start agent ───────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Starting agent${NC}\n\n"
 
-# Pre-flight: verify agent CLI is available
 if ! command_exists agent; then
     die "'agent' command not found in PATH — Cursor CLI is required"
 fi
 ok "agent CLI found at $(which agent)"
-
-# Kill existing session if present
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    tmux kill-session -t "$SESSION"
-    ok "Killed previous session"
-fi
 
 LAUNCH_SCRIPT="$INSTALL_DIR/.agent-launch.sh"
 cat > "$LAUNCH_SCRIPT" <<LAUNCH
 #!/usr/bin/env bash
 export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
 cd "$INSTALL_DIR"
+set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate
 exec python3 agent.py 2>&1
 LAUNCH
 chmod +x "$LAUNCH_SCRIPT"
 
-tmux new-session -d -s "$SESSION" -c "$INSTALL_DIR" "$LAUNCH_SCRIPT"
+PM2_NAME="agent"
 
-sleep 2
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    ok "Agent running in tmux session '${SESSION}'"
-else
-    err "Agent failed to start — attach to see error output:"
-    printf "    ${DIM}tmux new-session -s debug -c '$INSTALL_DIR' '$LAUNCH_SCRIPT'${NC}\n"
-    die "Try the above command to see the error interactively"
+# Install pm2 if needed
+if ! command_exists pm2; then
+    if ! command_exists npm && ! command_exists npx; then
+        if command_exists brew; then
+            run "Installing Node.js" brew install node
+        elif command_exists apt-get; then
+            run "Installing Node.js" bash -c "sudo apt-get update -qq && sudo apt-get install -y -qq nodejs npm"
+        else
+            die "npm/node required for pm2 — install Node.js first"
+        fi
+    fi
+    run "Installing pm2" npm install -g pm2
+    command_exists pm2 || die "pm2 install failed"
 fi
 
-# ── Done ─────────────────────────────────────────────────────────────────────
+# Stop existing instance if running
+pm2 delete "$PM2_NAME" 2>/dev/null || true
 
+pm2 start "$LAUNCH_SCRIPT" \
+    --name "$PM2_NAME" \
+    --cwd "$INSTALL_DIR" \
+    --log "$INSTALL_DIR/logs/agent.log" \
+    --time \
+    --restart-delay 10000
+
+pm2 save 2>/dev/null || true
+
+sleep 2
+if pm2 pid "$PM2_NAME" >/dev/null 2>&1 && [ -n "$(pm2 pid "$PM2_NAME")" ]; then
+    ok "Agent running"
+else
+    err "Agent may not have started — check logs:"
+    printf "    ${DIM}pm2 logs $PM2_NAME${NC}\n"
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────
 printf "\n"
 printf "  ${GREEN}${BOLD}Agent is live${NC}\n"
 printf "\n"
-printf "  ${DIM}attach${NC}   tmux attach -t ${SESSION}\n"
-printf "  ${DIM}logs${NC}     tmux attach -t ${SESSION} ${DIM}(Ctrl+B D to detach)${NC}\n"
-printf "  ${DIM}kill${NC}     tmux kill-session -t ${SESSION}\n"
+printf "  ${DIM}logs${NC}     pm2 logs $PM2_NAME\n"
+printf "  ${DIM}status${NC}   pm2 status\n"
+printf "  ${DIM}stop${NC}     pm2 stop $PM2_NAME\n"
+printf "  ${DIM}start${NC}    pm2 start $PM2_NAME\n"
+printf "  ${DIM}restart${NC}  pm2 restart $PM2_NAME\n"
 printf "\n"
