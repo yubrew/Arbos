@@ -49,5 +49,50 @@ Your goal is described below. Execute it. Dont stop.
 
 ## Goal 
 
-Make money with my hyperliquid account. 
-You have at your disposal a coinglass api with a professional subscription and a hyperliquid account with money on it. Both are accessible with the information in .env in this local repository. I want you to plan an execute a strategy to turn yourself into a world class quantatative trader on hyper liquid using all the state of the art tools to achieve your aims. Write code, train machine learning models, scrape data, build sentiment tools. DO WHAT EVER YOU THINK IS THE BEST WAY TO MAKE MONEY. You are welcome to research that topic if you need inspiration. 
+Build and deploy a **production-grade quantitative trading system** on Hyperliquid that generates consistent profit. You have a Hyperliquid account and a Coinglass Pro API — credentials are in `.env`.
+
+### Non-negotiable standards
+
+- **No naive strategies.** Simple moving-average crossovers, basic RSI, or single-indicator bots are NOT acceptable. If a strategy could be written in 50 lines of Python by a beginner, it is not good enough.
+- **Research before you build.** Before implementing anything, spend real effort studying what actually works. Search for recent papers, blog posts, and open-source projects on crypto quantitative trading, market microstructure, and alpha generation. Save your research notes in `research/` with sources. Build a `research/literature.md` file that catalogs what you found and what you're drawing from.
+- **Evidence-driven development.** Every strategy must be backtested on historical data before going live. Log Sharpe ratio, max drawdown, win rate, and profit factor. If you can't prove it works on historical data, don't deploy it.
+
+### What "state of the art" means — explore these areas
+
+You don't have to use all of these, but you should **investigate** them and pick what's most promising:
+
+- **Market microstructure**: Order flow analysis, volume imbalance, trade arrival modeling, bid-ask spread dynamics. Hyperliquid's L2 orderbook data is a goldmine — use it.
+- **Statistical arbitrage**: Cointegration between perps, cross-exchange basis trades, funding rate arbitrage.
+- **Machine learning alpha**: Feature engineering from OHLCV + orderbook + funding rates + open interest (via Coinglass). Models like gradient-boosted trees (XGBoost/LightGBM), temporal CNNs, or transformer-based sequence models for price prediction. Don't just predict price — predict *whether a trade will be profitable given your costs*.
+- **Sentiment & alternative data**: Scrape Twitter/X, Reddit, Telegram for sentiment signals. Use LLMs to score sentiment. Correlate with price action.
+- **Execution optimization**: Smart order routing, TWAP/VWAP execution, minimizing slippage. Your edge can be eaten entirely by poor execution.
+- **Risk management**: Position sizing via Kelly criterion or risk parity. Dynamic stop-losses. Portfolio-level VaR. Correlation-aware exposure limits. Max drawdown circuit breakers.
+- **Funding rate strategies**: Hyperliquid has funding rates — model their mean-reversion, predict extreme funding, and trade accordingly.
+
+### Phased approach
+
+**Phase 1 — Research & Data Infrastructure (do this FIRST)**
+- Study the Hyperliquid API docs and Coinglass API docs thoroughly. Document the available data endpoints.
+- Build a robust data pipeline: historical OHLCV, orderbook snapshots, funding rates, open interest, liquidation data.
+- Store data efficiently (parquet files or SQLite). Build a clean interface to query it.
+- Conduct exploratory data analysis. Look for patterns, anomalies, correlations. Save plots and findings.
+
+**Phase 2 — Strategy Development & Backtesting**
+- Implement a proper backtesting framework with realistic assumptions (fees, slippage, latency).
+- Develop at least 2-3 independent strategy candidates from different categories above.
+- Backtest each one. Compare metrics. Document results with actual numbers.
+- Select the best-performing strategy (or ensemble) based on risk-adjusted returns.
+
+**Phase 3 — Paper Trading & Validation**
+- Deploy the strategy in paper-trading mode (simulated execution against live data).
+- Run for a meaningful period. Compare live performance to backtest expectations.
+- If there's significant divergence, diagnose and fix before going live.
+
+**Phase 4 — Live Deployment**
+- Deploy with small position sizes first. Scale up only after demonstrating live profitability.
+- Implement monitoring: PnL tracking, drawdown alerts, error handling, auto-shutdown on anomalies.
+- Continuously log performance and iterate.
+
+### Mindset
+
+Think like a quant fund, not a retail trader. Your competitive advantages are: (1) you can process more information than a human, (2) you can iterate faster, (3) you have no emotional bias. Exploit these. The goal is not just "a bot that trades" — it's a *system* that has a demonstrable, evidence-backed edge. If you can't articulate why your strategy should make money in a paragraph, you don't understand it well enough to deploy it.
