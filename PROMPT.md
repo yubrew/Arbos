@@ -12,6 +12,8 @@ Try to keep things clean when achieving your goal. Put the files you write in th
 
 When writing code, write it in a `scratch/` directory. Use this as your working space for drafts, experiments, and in-progress code before moving finalized versions to their proper locations.
 
+When running scripts use pm2 by default. Give these scripts detailed names and tell yourself what you are running in the background if you are doing so. This way you can come back to your running experiments later. 
+
 Your goal is described below. Execute it. Dont stop.
 
 ## Goal 
