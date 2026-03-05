@@ -251,24 +251,10 @@ ask_key "CURSOR_API_KEY" \
 
 printf "\n"
 
-ask_key "HL_SECRET_KEY" \
-    "Hyperliquid secret key" \
-    "Export your wallet private key from MetaMask: Settings → Security → Reveal private key" \
-    "required"
-
-printf "\n"
-
-ask_key "COINGLASS_API_KEY" \
-    "Coinglass API key" \
-    "Get yours at: https://www.coinglass.com/pricing (professional plan required)" \
-    "required"
-
-printf "\n"
-
 ask_key "TAU_BOT_TOKEN" \
-    "Telegram bot token (optional, skip to disable)" \
+    "Telegram bot token" \
     "Create a bot via @BotFather on Telegram, then paste the token here" \
-    "optional"
+    "required"
 
 printf "\n"
 
@@ -335,9 +321,11 @@ printf "  ${GREEN}${BOLD}Arbos is live${NC}\n"
 printf "\n"
 printf "  ${DIM}logs${NC}     pm2 logs $PM2_NAME\n"
 printf "  ${DIM}status${NC}   pm2 status\n"
-printf "  ${DIM}stop${NC}     pm2 stop $PM2_NAME\n"
-printf "  ${DIM}start${NC}    pm2 start $PM2_NAME\n"
 printf "  ${DIM}restart${NC}  pm2 restart $PM2_NAME\n"
 printf "\n"
-printf "  Open Telegram and send /start to your bot to connect.\n"
+printf "  ${BOLD}Next steps — open Telegram and message your bot:${NC}\n"
+printf "    1. /prompt <system prompt>\n"
+printf "    2. /goal <your goal>\n"
+printf "    3. /env KEY=VALUE  (for any API keys)\n"
+printf "    4. /start\n"
 printf "\n"

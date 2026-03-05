@@ -13,9 +13,14 @@ WORKING_DIR = Path(__file__).parent
 load_dotenv(WORKING_DIR / ".env")
 
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
+GOAL_FILE = WORKING_DIR / "GOAL.md"
 HISTORY_DIR = WORKING_DIR / "history"
 RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
+
+_agent_lock = threading.Lock()
+_loop_stop = threading.Event()
+_loop_thread: threading.Thread | None = None
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -30,13 +35,15 @@ else:
     GREEN = RED = CYAN = BOLD = DIM = NC = ''
 
 _log_fh = None
+_log_lock = threading.Lock()
 
 
 def _file_log(msg: str):
-    if _log_fh:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _log_fh.write(f"{ts}  {msg}\n")
-        _log_fh.flush()
+    with _log_lock:
+        if _log_fh:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _log_fh.write(f"{ts}  {msg}\n")
+            _log_fh.flush()
 
 
 def ok(msg: str):
@@ -81,15 +88,20 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
+# ── File helpers ─────────────────────────────────────────────────────────────
+
 def load_prompt() -> str:
-    if not PROMPT_FILE.exists():
-        err(f"Prompt file not found: {PROMPT_FILE}")
-        sys.exit(1)
-    text = PROMPT_FILE.read_text().strip()
-    if not text:
-        err(f"Prompt file is empty: {PROMPT_FILE}")
-        sys.exit(1)
-    return text
+    """Build full prompt from PROMPT.md + GOAL.md."""
+    parts = []
+    if PROMPT_FILE.exists():
+        text = PROMPT_FILE.read_text().strip()
+        if text:
+            parts.append(text)
+    if GOAL_FILE.exists():
+        goal = GOAL_FILE.read_text().strip()
+        if goal:
+            parts.append(f"### Goal\n\n{goal}")
+    return "\n\n".join(parts)
 
 
 def make_run_dir() -> Path:
@@ -215,7 +227,8 @@ def run_step(prompt: str) -> bool:
     t0 = time.monotonic()
 
     log_file = run_dir / "logs.txt"
-    _log_fh = open(log_file, "a", encoding="utf-8")
+    with _log_lock:
+        _log_fh = open(log_file, "a", encoding="utf-8")
 
     dim(f"run dir  {run_dir}")
     dim(f"log file {log_file}")
@@ -237,8 +250,9 @@ def run_step(prompt: str) -> bool:
 
     if plan_result.returncode != 0:
         err(f"Plan phase exited with code {plan_result.returncode} — skipping execution")
-        _log_fh.close()
-        _log_fh = None
+        with _log_lock:
+            _log_fh.close()
+            _log_fh = None
         return False
 
     header("Execution")
@@ -269,12 +283,52 @@ def run_step(prompt: str) -> bool:
 
     dim(f"total duration: {fmt_duration(elapsed)}")
 
-    _log_fh.close()
-    _log_fh = None
+    with _log_lock:
+        _log_fh.close()
+        _log_fh = None
     return success
 
 
-# ── Telegram bot (runs in a background thread) ──────────────────────────────
+# ── Agent loop (started/stopped via Telegram) ───────────────────────────────
+
+def agent_loop(bot, chat_id: int):
+    loop_count = 0
+    consecutive_failures = 0
+
+    while not _loop_stop.is_set():
+        prompt = load_prompt()
+        if not prompt:
+            _loop_stop.wait(5)
+            continue
+
+        loop_count += 1
+        header(f"Iteration {loop_count}")
+        dim(f"prompt={len(prompt)} chars")
+
+        with _agent_lock:
+            success = run_step(prompt)
+
+        if RESTART_FLAG.exists():
+            RESTART_FLAG.unlink()
+            ok("Restart requested — exiting for pm2")
+            sys.exit(0)
+
+        if success:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            delay = min(2 ** consecutive_failures, 120)
+            err(f"Backing off for {delay}s after {consecutive_failures} consecutive failure(s)")
+            _loop_stop.wait(delay)
+
+    ok("Agent loop stopped")
+    try:
+        bot.send_message(chat_id, "⏹ Agent loop stopped.")
+    except Exception:
+        pass
+
+
+# ── Telegram streaming agent ────────────────────────────────────────────────
 
 def _recent_context(max_chars: int = 6000) -> str:
     if not HISTORY_DIR.exists():
@@ -299,9 +353,7 @@ def _recent_context(max_chars: int = 6000) -> str:
 
 
 def _build_ask_prompt(question: str) -> str:
-    prompt_md = ""
-    if PROMPT_FILE.exists():
-        prompt_md = PROMPT_FILE.read_text()[:1500]
+    prompt_md = load_prompt()[:2000]
     context = _recent_context()
     return (
         "You are answering a question about the Arbos trading agent.\n\n"
@@ -406,12 +458,15 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False
     return current_text
 
 
-def start_telegram_bot():
-    """Start the Telegram bot in a daemon thread. No-op if TAU_BOT_TOKEN is unset."""
+# ── Telegram bot ─────────────────────────────────────────────────────────────
+
+def run_bot():
+    """Run the Telegram bot. Blocks forever (with auto-reconnect)."""
     token = os.getenv("TAU_BOT_TOKEN")
     if not token:
-        dim("TAU_BOT_TOKEN not set — Telegram bot disabled")
-        return
+        err("TAU_BOT_TOKEN not set — add it to .env and restart")
+        err("  Get a token from @BotFather on Telegram")
+        sys.exit(1)
 
     import telebot
     bot = telebot.TeleBot(token)
@@ -419,24 +474,136 @@ def start_telegram_bot():
     def _save_chat_id(chat_id: int):
         CHAT_ID_FILE.write_text(str(chat_id))
 
+    def _is_loop_running() -> bool:
+        return _loop_thread is not None and _loop_thread.is_alive()
+
+    # ── /start — start the agent loop ────────────────────────────────────
+
     @bot.message_handler(commands=["start"])
     def handle_start(message):
+        global _loop_thread
         _save_chat_id(message.chat.id)
-        bot.reply_to(
-            message,
-            "Connected to Arbos.\n\n"
-            "Send any message to ask about current status, PnL, strategy, etc.\n"
-            "Use /adapt <description> to modify the code.",
+
+        if _is_loop_running():
+            bot.reply_to(message, "🟢 Already running. Use /stop first.")
+            return
+
+        prompt = load_prompt()
+        if not prompt:
+            missing = []
+            if not (PROMPT_FILE.exists() and PROMPT_FILE.read_text().strip()):
+                missing.append("/prompt <text>")
+            if not (GOAL_FILE.exists() and GOAL_FILE.read_text().strip()):
+                missing.append("/goal <text>")
+            bot.reply_to(message, "Set up first:\n" + "\n".join(f"  • {m}" for m in missing))
+            return
+
+        _loop_stop.clear()
+        _loop_thread = threading.Thread(
+            target=agent_loop, args=(bot, message.chat.id), daemon=True,
         )
+        _loop_thread.start()
+        bot.reply_to(message, "▶️ Agent loop started.")
+
+    # ── /stop — stop the agent loop ──────────────────────────────────────
+
+    @bot.message_handler(commands=["stop"])
+    def handle_stop(message):
+        _save_chat_id(message.chat.id)
+        if not _is_loop_running():
+            bot.reply_to(message, "Not running.")
+            return
+        _loop_stop.set()
+        bot.reply_to(message, "⏹ Stopping after current step finishes…")
+
+    # ── /prompt — replace PROMPT.md ──────────────────────────────────────
+
+    @bot.message_handler(commands=["prompt"])
+    def handle_prompt(message):
+        _save_chat_id(message.chat.id)
+        text = message.text.replace("/prompt", "", 1).strip()
+        if not text:
+            current = PROMPT_FILE.read_text().strip() if PROMPT_FILE.exists() else "(empty)"
+            bot.reply_to(message, f"Current prompt:\n\n{current[:3500]}")
+            return
+        PROMPT_FILE.write_text(text)
+        bot.reply_to(message, f"✅ Prompt set ({len(text)} chars)")
+
+    # ── /goal — replace GOAL.md ──────────────────────────────────────────
+
+    @bot.message_handler(commands=["goal"])
+    def handle_goal(message):
+        _save_chat_id(message.chat.id)
+        text = message.text.replace("/goal", "", 1).strip()
+        if not text:
+            current = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else "(empty)"
+            bot.reply_to(message, f"Current goal:\n\n{current[:3500]}")
+            return
+        GOAL_FILE.write_text(text)
+        bot.reply_to(message, f"✅ Goal set ({len(text)} chars)")
+
+    # ── /env — add/update .env variable ──────────────────────────────────
+
+    @bot.message_handler(commands=["env"])
+    def handle_env(message):
+        _save_chat_id(message.chat.id)
+        text = message.text.replace("/env", "", 1).strip()
+        if not text or "=" not in text:
+            bot.reply_to(message, "Usage: /env KEY=VALUE [description]")
+            return
+
+        key, _, rest = text.partition("=")
+        key = key.strip()
+
+        # Split VALUE from optional description at first whitespace after value
+        # Handles: KEY=VALUE description of this key
+        parts = rest.strip().split(None, 1)
+        value = parts[0] if parts else ""
+        description = parts[1] if len(parts) > 1 else None
+
+        env_file = WORKING_DIR / ".env"
+        lines = []
+        replaced = False
+        if env_file.exists():
+            # When replacing, also remove the old comment line above it
+            prev_was_comment_for_key = False
+            for line in env_file.read_text().splitlines():
+                if line.startswith("#") and not prev_was_comment_for_key:
+                    # Check if next line is our key (peek ahead handled below)
+                    prev_was_comment_for_key = True
+                    lines.append(line)
+                    continue
+                if line.startswith(f"{key}="):
+                    # Remove previous comment for this key if present
+                    if prev_was_comment_for_key and lines:
+                        lines.pop()
+                    if description:
+                        lines.append(f"# {description}")
+                    lines.append(f"{key}={value}")
+                    replaced = True
+                else:
+                    lines.append(line)
+                prev_was_comment_for_key = False
+        if not replaced:
+            if description:
+                lines.append(f"# {description}")
+            lines.append(f"{key}={value}")
+        env_file.write_text("\n".join(lines) + "\n")
+        os.environ[key] = value
+        reply = f"✅ {key} set"
+        if description:
+            reply += f" ({description})"
+        bot.reply_to(message, reply)
+
+    # ── /adapt — modify code and restart ─────────────────────────────────
 
     @bot.message_handler(commands=["adapt"])
     def handle_adapt(message):
+        _save_chat_id(message.chat.id)
         prompt = message.text.replace("/adapt", "", 1).strip()
         if not prompt:
             bot.reply_to(message, "Usage: /adapt <description of changes>")
             return
-
-        _save_chat_id(message.chat.id)
 
         full_prompt = (
             "You are modifying the Arbos trading agent codebase.\n"
@@ -444,61 +611,85 @@ def start_telegram_bot():
             "Make the changes directly to the code files in the project."
         )
 
-        bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
-        run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+        if _agent_lock.locked():
+            bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
 
-        try:
-            RESTART_FLAG.touch()
-            subprocess.run(["pm2", "restart", "arbos"], capture_output=True, timeout=10)
-            bot.send_message(message.chat.id, "✅ Code updated, Arbos restarting…")
-        except Exception as e:
-            bot.send_message(message.chat.id, f"⚠️ Restart failed: {str(e)[:200]}")
+        bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
+        with _agent_lock:
+            run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+
+        bot.send_message(message.chat.id, "✅ Code updated. Restarting…")
+        RESTART_FLAG.touch()
+
+    # ── /status — show current state ─────────────────────────────────────
+
+    @bot.message_handler(commands=["status"])
+    def handle_status(message):
+        _save_chat_id(message.chat.id)
+        running = "🟢 Running" if _is_loop_running() else "⏹ Stopped"
+        prompt_ok = "✅" if (PROMPT_FILE.exists() and PROMPT_FILE.read_text().strip()) else "❌"
+        goal_ok = "✅" if (GOAL_FILE.exists() and GOAL_FILE.read_text().strip()) else "❌"
+
+        bot.reply_to(message, (
+            f"Loop: {running}\n"
+            f"Prompt: {prompt_ok}\n"
+            f"Goal: {goal_ok}\n\n"
+            "Commands:\n"
+            "/prompt <text> — set system prompt\n"
+            "/goal <text> — set goal\n"
+            "/env KEY=VALUE — set env variable\n"
+            "/start — start agent loop\n"
+            "/stop — stop agent loop\n"
+            "/adapt <desc> — modify code & restart\n"
+            "/status — this message"
+        ))
+
+    # ── free text — ask the agent ────────────────────────────────────────
 
     @bot.message_handler(func=lambda m: True)
     def handle_question(message):
         _save_chat_id(message.chat.id)
-        prompt = _build_ask_prompt(message.text)
-        run_agent_streaming(bot, prompt, message.chat.id, execute=False)
+        ask_prompt = _build_ask_prompt(message.text)
 
-    def _run():
-        ok("Telegram bot started")
-        bot.infinity_polling()
+        if _agent_lock.locked():
+            bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+        with _agent_lock:
+            run_agent_streaming(bot, ask_prompt, message.chat.id, execute=False)
+
+    # ── start polling with auto-reconnect ────────────────────────────────
+
+    ok("Telegram bot started — waiting for commands")
+    while True:
+        try:
+            bot.infinity_polling()
+        except Exception as e:
+            err(f"Bot polling error: {str(e)[:80]}, reconnecting in 5s…")
+            time.sleep(5)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     banner()
-    header("Arbos loop")
+    header("Arbos")
 
     dim(f"prompt   {PROMPT_FILE}")
+    dim(f"goal     {GOAL_FILE}")
     dim(f"workdir  {WORKING_DIR}")
     dim(f"history  {HISTORY_DIR}")
 
-    start_telegram_bot()
+    # Start bot in a background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
 
-    loop_count = 0
-    consecutive_failures = 0
+    # Main thread: watch for .restart flag (touched by /adapt)
     while True:
-        loop_count += 1
-        prompt = load_prompt()
-        header(f"Iteration {loop_count}")
-        dim(f"prompt={len(prompt)} chars")
-        success = run_step(prompt)
         if RESTART_FLAG.exists():
             RESTART_FLAG.unlink()
             ok("Restart requested — exiting for pm2 to restart with updated code")
             sys.exit(0)
-        if success:
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            delay = min(2 ** consecutive_failures, 120)
-            err(f"Backing off for {delay}s after {consecutive_failures} consecutive failure(s)")
-            time.sleep(delay)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
