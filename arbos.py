@@ -87,10 +87,22 @@ def fmt_duration(seconds: float) -> str:
 
 # ── Agent helpers ─────────────────────────────────────────────────────────────
 
-def agent_file(aid: str) -> Path:
+def _agent_dir(aid: str) -> Path:
     d = CONTEXT_DIR / aid
     d.mkdir(parents=True, exist_ok=True)
-    return d / "AGENT.md"
+    return d
+
+
+def goal_file(aid: str) -> Path:
+    return _agent_dir(aid) / "GOAL.md"
+
+
+def state_file(aid: str) -> Path:
+    return _agent_dir(aid) / "STATE.md"
+
+
+def inbox_file(aid: str) -> Path:
+    return _agent_dir(aid) / "INBOX.md"
 
 
 def load_agents() -> dict:
@@ -108,25 +120,36 @@ def save_agents(data: dict):
 
 # ── File helpers ─────────────────────────────────────────────────────────────
 
-def load_prompt(agent_id: str | None = None) -> str:
-    """Build full prompt from PROMPT.md + AGENT-<id>.md + recent chatlog."""
+def load_prompt(agent_id: str | None = None, consume_inbox: bool = False) -> str:
+    """Build full prompt: PROMPT + GOAL + STATE + INBOX + chatlog. Optionally clears INBOX."""
     parts = []
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
             parts.append(text)
     if agent_id:
-        af = agent_file(agent_id)
         parts.append(
             f"### Active Agent: `{agent_id}`\n\n"
-            f"You are currently working on agent `{agent_id}`. "
-            f"Your agent-specific state file is `context/{agent_id}/AGENT.md` — "
-            f"edit it to leave yourself notes and context for the next step."
+            f"Edit `context/{agent_id}/STATE.md` to record progress. "
+            f"Do not edit GOAL.md."
         )
-        if af.exists():
-            agent_text = af.read_text().strip()
-            if agent_text:
-                parts.append(agent_text)
+        gf = goal_file(agent_id)
+        if gf.exists():
+            goal_text = gf.read_text().strip()
+            if goal_text:
+                parts.append(f"## Goal\n\n{goal_text}")
+        sf = state_file(agent_id)
+        if sf.exists():
+            state_text = sf.read_text().strip()
+            if state_text:
+                parts.append(f"## State\n\n{state_text}")
+        ibf = inbox_file(agent_id)
+        if ibf.exists():
+            inbox_text = ibf.read_text().strip()
+            if inbox_text:
+                parts.append(f"## Inbox\n\n{inbox_text}")
+            if consume_inbox:
+                ibf.write_text("")
     chatlog = load_chatlog()
     if chatlog:
         parts.append(chatlog)
@@ -409,7 +432,7 @@ def agent_loop():
         step_count += 1
         header(f"Step {step_count}  agent={best_id}")
 
-        prompt = load_prompt(best_id)
+        prompt = load_prompt(best_id, consume_inbox=True)
         if not prompt:
             time.sleep(5)
             continue
@@ -573,8 +596,10 @@ def _build_agent_status_prompt(aid: str) -> str:
     agents = load_agents()
     meta = agents.get(aid, {})
     agent_dir = CONTEXT_DIR / aid
-    af = agent_file(aid)
-    agent_text = af.read_text().strip() if af.exists() else "(no AGENT.md)"
+    gf = goal_file(aid)
+    sf = state_file(aid)
+    goal_text = gf.read_text().strip() if gf.exists() else "(no GOAL.md)"
+    state_text = sf.read_text().strip() if sf.exists() else "(no STATE.md)"
 
     run_dirs = sorted(
         [d for d in agent_dir.iterdir() if d.is_dir()],
@@ -605,12 +630,13 @@ def _build_agent_status_prompt(aid: str) -> str:
         f"- Last run: {last_run_str}\n"
         f"- Consecutive failures: {failures}\n"
         f"- Total runs on disk: {len(run_dirs)}\n\n"
-        f"## AGENT.md (the agent's own notes)\n```\n{agent_text}\n```\n\n"
+        f"## GOAL.md\n```\n{goal_text}\n```\n\n"
+        f"## STATE.md\n```\n{state_text}\n```\n\n"
         f"## Recent runs (newest first, up to 5)\n\n"
         + ("\n".join(run_summaries) if run_summaries else "(no runs yet)\n")
         + "\n## What to report\n"
         "Synthesize the above into a short status report covering:\n"
-        "1. **What the agent is** — one-line summary from AGENT.md\n"
+        "1. **What the agent is** — one-line summary from GOAL.md\n"
         "2. **Current state** — is it actively running, idle, or stuck in a failure loop?\n"
         "3. **Last run outcome** — did it succeed or fail? What did it do? (cite the plan/rollout)\n"
         "4. **Progress & trajectory** — what has it accomplished across recent runs? Is it making forward progress or looping?\n"
@@ -623,8 +649,7 @@ def _build_agent_status_prompt(aid: str) -> str:
 def _handle_agent_status(bot, message, aid: str):
     """Spawn a CLI agent to analyze an agent's run state and stream the result to Telegram."""
     agents = load_agents()
-    agent_dir = CONTEXT_DIR / aid
-    if aid not in agents and not agent_dir.exists():
+    if aid not in agents and not goal_file(aid).exists():
         bot.reply_to(message, f"Agent `{aid}` not found.")
         return
 
@@ -679,8 +704,8 @@ def run_bot():
                 return
             lines = []
             for aid, meta in agents.items():
-                af = agent_file(aid)
-                preview = af.read_text().strip()[:80] if af.exists() else "(no file)"
+                gf = goal_file(aid)
+                preview = gf.read_text().strip()[:80] if gf.exists() else "(no goal)"
                 lines.append(f"• {aid}  delay={meta.get('delay', '?')}s  {preview}")
             bot.reply_to(message, "\n".join(lines))
             return
@@ -689,13 +714,15 @@ def run_bot():
         aid = parts[0]
 
         if len(parts) == 1:
-            af = agent_file(aid)
-            if aid not in agents and not af.exists():
+            gf = goal_file(aid)
+            if aid not in agents and not gf.exists():
                 bot.reply_to(message, f"Agent `{aid}` not found.")
                 return
-            content = af.read_text().strip() if af.exists() else "(empty)"
+            goal = gf.read_text().strip() if gf.exists() else "(no goal)"
+            sf = state_file(aid)
+            state = sf.read_text().strip() if sf.exists() else "(no state)"
             meta = agents.get(aid, {})
-            bot.reply_to(message, f"Agent {aid}  delay={meta.get('delay', '?')}s\n\n{content[:3500]}")
+            bot.reply_to(message, f"Agent {aid}  delay={meta.get('delay', '?')}s\n\n📎 Goal:\n{goal[:1500]}\n\n📌 State:\n{state[:1500]}")
             return
 
         try:
@@ -707,7 +734,7 @@ def run_bot():
         description = parts[2] if len(parts) > 2 else ""
         agents[aid] = {"delay": delay, "last_run": agents.get(aid, {}).get("last_run", 0), "failures": 0}
         save_agents(agents)
-        agent_file(aid).write_text(description + "\n")
+        goal_file(aid).write_text(description + "\n")
         bot.reply_to(message, f"✅ Agent `{aid}` set  delay={delay}s  ({len(description)} chars)")
         log_chat("bot", f"Agent set: {aid} delay={delay}s {description[:200]}")
 
@@ -727,33 +754,34 @@ def run_bot():
             return
         agents.pop(aid)
         save_agents(agents)
-        af = agent_file(aid)
-        if af.exists():
-            af.unlink()
+        for f in (goal_file(aid), state_file(aid), inbox_file(aid)):
+            if f.exists():
+                f.unlink()
         bot.reply_to(message, f"🗑 Agent `{aid}` deleted.")
         log_chat("bot", f"Agent deleted: {aid}")
 
-    # ── /append — append to an agent's AGENT.md ──────────────────────────
+    # ── /message — send a message to an agent's inbox ──────────────────
 
-    @bot.message_handler(commands=["append"])
-    def handle_append(message):
+    @bot.message_handler(commands=["message"])
+    def handle_message(message):
         _save_chat_id(message.chat.id)
         log_chat("user", message.text)
-        text = message.text.replace("/append", "", 1).strip()
+        text = message.text.replace("/message", "", 1).strip()
         parts = text.split(None, 1)
         if len(parts) < 2:
-            bot.reply_to(message, "Usage: /append <uuid> <text to append>")
+            bot.reply_to(message, "Usage: /message <uuid> <text>")
             return
         aid, content = parts
         agents = load_agents()
         if aid not in agents:
             bot.reply_to(message, f"Agent `{aid}` not found.")
             return
-        af = agent_file(aid)
-        with open(af, "a", encoding="utf-8") as f:
-            f.write("\n" + content + "\n")
-        bot.reply_to(message, f"✅ Appended to {aid} AGENT.md ({len(content)} chars)")
-        log_chat("bot", f"Appended to {aid}: {content[:200]}")
+        ibf = inbox_file(aid)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(ibf, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {content}\n")
+        bot.reply_to(message, f"✅ Message queued for {aid} ({len(content)} chars)")
+        log_chat("bot", f"Message to {aid}: {content[:200]}")
 
     # ── /env — add/update .env variable ──────────────────────────────────
 
@@ -853,10 +881,9 @@ def run_bot():
             + ("\n".join(agent_lines) + "\n" if agent_lines else "")
             + "\nCommands:\n"
             "/prompt <text> — set system prompt\n"
-            "/agent <uuid> <delay_s> <desc> — add agent\n"
-            "/agent — list agents\n"
+            "/agent <uuid> <delay_s> <desc> — add/view agent\n"
             "/delete <uuid> — remove agent\n"
-            "/append <uuid> <text> — append to AGENT.md\n"
+            "/message <uuid> <text> — send to agent inbox\n"
             "/env KEY=VALUE — set env variable\n"
             "/adapt <desc> — modify code & restart\n"
             "/logs [agent] [N] — tail logs\n"
