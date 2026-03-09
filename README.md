@@ -7,6 +7,14 @@
   That's all you need to do just about anything.
 </p>
 
+## Architecture
+
+```
+  You ──► Telegram Bot ──► GOAL.md ──► Agent Loop ──► Cursor CLI
+   ▲                                                      │
+   └──────────────────── step updates ────────────────────┘
+```
+
 ## Getting started
 
 ```sh
