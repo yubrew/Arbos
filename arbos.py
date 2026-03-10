@@ -1,5 +1,7 @@
 import json
 import os
+import queue
+import shutil
 import subprocess
 import sys
 import time
@@ -25,10 +27,27 @@ CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
 STEP_UPDATE_CHAR_LIMIT = 500
 STEP_SOURCE_CHAR_LIMIT = 3500
 STEP_SUMMARY_MODEL = ""
+CODEX_POOL_SIZE = int(os.environ.get("CODEX_POOL_SIZE", "4"))
 
 _log_fh = None
 _log_lock = threading.Lock()
 _agent_wake = threading.Event()
+_codex_pool: queue.Queue[str] = queue.Queue()
+
+
+def _init_codex_pool():
+    """Create a pool of isolated CODEX_HOME directories so multiple runs can happen in parallel."""
+    pool_dir = WORKING_DIR / ".codex-pool"
+    pool_dir.mkdir(exist_ok=True)
+    config_src = Path.home() / ".codex" / "config.toml"
+    for i in range(CODEX_POOL_SIZE):
+        home = pool_dir / str(i)
+        home.mkdir(exist_ok=True)
+        config_dst = home / "config.toml"
+        if config_src.exists():
+            shutil.copy2(config_src, config_dst)
+        _codex_pool.put(str(home))
+    _log(f"codex pool initialised with {CODEX_POOL_SIZE} homes")
 
 
 def _file_log(msg: str):
@@ -280,49 +299,61 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
-def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
+def _codex_env() -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
+    env.pop("CODEX_SANDBOX", None)
     api_key = env.get("OPENAI_API_KEY")
     if api_key:
         env["CODEX_API_KEY"] = api_key
+    return env
 
-    preview = " ".join(cmd[:6]) + ("…" if len(cmd) > 6 else "")
-    _log(f"{phase}: starting {preview}")
-    t0 = time.monotonic()
 
-    proc = subprocess.Popen(
-        cmd, cwd=WORKING_DIR, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
-    )
+def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
+    codex_home = _codex_pool.get()
+    try:
+        env = _codex_env()
+        env["CODEX_HOME"] = codex_home
 
-    result_text = ""
-    raw_lines: list[str] = []
-    for line in iter(proc.stdout.readline, ""):
-        raw_lines.append(line)
-        try:
-            evt = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        etype = evt.get("type", "")
-        if etype == "item.completed":
-            item = evt.get("item", {})
-            if item.get("type") == "agent_message":
-                result_text = item.get("text", "")
+        preview = " ".join(cmd[:6]) + ("…" if len(cmd) > 6 else "")
+        _log(f"{phase}: starting {preview} (home={codex_home})")
+        t0 = time.monotonic()
 
-    stderr_output = proc.stderr.read() if proc.stderr else ""
-    returncode = proc.wait()
-    elapsed = time.monotonic() - t0
-    output_file.write_text("".join(raw_lines))
+        proc = subprocess.Popen(
+            cmd, cwd=WORKING_DIR, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
 
-    _log(f"{phase}: finished rc={returncode} {fmt_duration(elapsed)}")
-    if returncode != 0 and stderr_output.strip():
-        _log(f"{phase}: stderr {stderr_output.strip()[:300]}")
+        result_text = ""
+        raw_lines: list[str] = []
+        for line in iter(proc.stdout.readline, ""):
+            raw_lines.append(line)
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = evt.get("type", "")
+            if etype == "item.completed":
+                item = evt.get("item", {})
+                if item.get("type") == "agent_message":
+                    result_text = item.get("text", "")
 
-    return subprocess.CompletedProcess(
-        args=cmd, returncode=returncode,
-        stdout=result_text, stderr=stderr_output,
-    )
+        stderr_output = proc.stderr.read() if proc.stderr else ""
+        returncode = proc.wait()
+        elapsed = time.monotonic() - t0
+        output_file.write_text("".join(raw_lines))
+
+        _log(f"{phase}: finished rc={returncode} {fmt_duration(elapsed)}")
+        if returncode != 0 and stderr_output.strip():
+            _log(f"{phase}: stderr {stderr_output.strip()[:300]}")
+
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=returncode,
+            stdout=result_text, stderr=stderr_output,
+        )
+    finally:
+        _codex_pool.put(codex_home)
 
 
 def extract_text(result: subprocess.CompletedProcess) -> str:
@@ -497,15 +528,10 @@ def _build_operator_prompt(user_text: str) -> str:
 def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
     """Run the Codex CLI and stream output into a Telegram message."""
     cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json"]
-
     cmd.append(prompt)
 
-    env = os.environ.copy()
-    api_key = env.get("OPENAI_API_KEY")
-    if api_key:
-        env["CODEX_API_KEY"] = api_key
-
-    msg = bot.send_message(chat_id, "Running...")
+    waiting = _codex_pool.empty()
+    msg = bot.send_message(chat_id, "Waiting for a free slot..." if waiting else "Running...")
     current_text = ""
     last_edit = 0.0
 
@@ -523,7 +549,14 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         except Exception:
             pass
 
+    codex_home = _codex_pool.get()
     try:
+        env = _codex_env()
+        env["CODEX_HOME"] = codex_home
+
+        if waiting:
+            _edit("Running...", force=True)
+
         proc = subprocess.Popen(
             cmd, cwd=WORKING_DIR, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -561,6 +594,8 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
             bot.edit_message_text(f"Error: {str(e)[:300]}", chat_id, msg.message_id)
         except Exception:
             pass
+    finally:
+        _codex_pool.put(codex_home)
 
     return current_text
 
@@ -614,6 +649,7 @@ def run_bot():
 def main() -> None:
     _log(f"arbos starting in {WORKING_DIR}")
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    _init_codex_pool()
 
     threading.Thread(target=agent_loop, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()

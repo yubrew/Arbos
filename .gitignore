@@ -19,4 +19,5 @@ logs/*
 .arbos-launch.sh
 .arbos.pid
 .restart
+.codex-pool/
 chat_id.txt
