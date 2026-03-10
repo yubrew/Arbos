@@ -374,10 +374,10 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
     _claude_semaphore.acquire()
     try:
         env = _claude_env()
-        preview = " ".join(cmd[:6]) + ("…" if len(cmd) > 6 else "")
+        flags = " ".join(a for a in cmd if a.startswith("-"))
 
         for attempt in range(1, MAX_RETRIES + 1):
-            _log(f"{phase}: starting {preview} (attempt={attempt})")
+            _log(f"{phase}: starting (attempt={attempt}) flags=[{flags}]")
             t0 = time.monotonic()
 
             returncode, result_text, raw_lines, stderr_output = _run_claude_once(cmd, env)
@@ -433,7 +433,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
         _log(f"prompt preview: {preview}")
 
-        _send_telegram_text(f"Step {step_number}: starting plan phase")
+        _log(f"step {step_number}: plan phase")
 
         plan_result = run_agent(
             ["claude", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
@@ -455,7 +455,7 @@ def run_step(prompt: str, step_number: int) -> bool:
             f"Now implement this plan. The original request was:\n\n{prompt}"
         )
 
-        _send_telegram_text(f"Step {step_number}: starting exec phase")
+        _log(f"step {step_number}: exec phase")
 
         exec_result = run_agent(
             ["claude", "-p", execute_prompt, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
