@@ -309,6 +309,44 @@ def _codex_env() -> dict[str, str]:
     return env
 
 
+MAX_RETRIES = int(os.environ.get("CODEX_MAX_RETRIES", "5"))
+BUSY_PATTERN = "Busy running another request"
+
+
+def _run_codex_once(cmd, env):
+    """Run a single codex subprocess, return (proc_result, result_text, raw_lines, stderr)."""
+    proc = subprocess.Popen(
+        cmd, cwd=WORKING_DIR, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+
+    result_text = ""
+    raw_lines: list[str] = []
+    for line in iter(proc.stdout.readline, ""):
+        raw_lines.append(line)
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        etype = evt.get("type", "")
+        if etype == "item.completed":
+            item = evt.get("item", {})
+            if item.get("type") == "agent_message":
+                result_text = item.get("text", "")
+
+    stderr_output = proc.stderr.read() if proc.stderr else ""
+    returncode = proc.wait()
+    return returncode, result_text, raw_lines, stderr_output
+
+
+def _is_busy_error(returncode, stderr_output, raw_lines):
+    if returncode == 0:
+        return False
+    combined = stderr_output + "".join(raw_lines[-5:])
+    return BUSY_PATTERN in combined
+
+
 def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
     codex_home = _codex_pool.get()
     try:
@@ -316,38 +354,32 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
         env["CODEX_HOME"] = codex_home
 
         preview = " ".join(cmd[:6]) + ("…" if len(cmd) > 6 else "")
-        _log(f"{phase}: starting {preview} (home={codex_home})")
-        t0 = time.monotonic()
 
-        proc = subprocess.Popen(
-            cmd, cwd=WORKING_DIR, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
+        for attempt in range(1, MAX_RETRIES + 1):
+            _log(f"{phase}: starting {preview} (home={codex_home}, attempt={attempt})")
+            t0 = time.monotonic()
 
-        result_text = ""
-        raw_lines: list[str] = []
-        for line in iter(proc.stdout.readline, ""):
-            raw_lines.append(line)
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
+            returncode, result_text, raw_lines, stderr_output = _run_codex_once(cmd, env)
+            elapsed = time.monotonic() - t0
+
+            if _is_busy_error(returncode, stderr_output, raw_lines):
+                delay = min(2 ** attempt, 30)
+                _log(f"{phase}: API busy, retrying in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(delay)
                 continue
-            etype = evt.get("type", "")
-            if etype == "item.completed":
-                item = evt.get("item", {})
-                if item.get("type") == "agent_message":
-                    result_text = item.get("text", "")
 
-        stderr_output = proc.stderr.read() if proc.stderr else ""
-        returncode = proc.wait()
-        elapsed = time.monotonic() - t0
+            output_file.write_text("".join(raw_lines))
+            _log(f"{phase}: finished rc={returncode} {fmt_duration(elapsed)}")
+            if returncode != 0 and stderr_output.strip():
+                _log(f"{phase}: stderr {stderr_output.strip()[:300]}")
+
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=returncode,
+                stdout=result_text, stderr=stderr_output,
+            )
+
+        _log(f"{phase}: all {MAX_RETRIES} retries exhausted (API busy)")
         output_file.write_text("".join(raw_lines))
-
-        _log(f"{phase}: finished rc={returncode} {fmt_duration(elapsed)}")
-        if returncode != 0 and stderr_output.strip():
-            _log(f"{phase}: stderr {stderr_output.strip()[:300]}")
-
         return subprocess.CompletedProcess(
             args=cmd, returncode=returncode,
             stdout=result_text, stderr=stderr_output,
@@ -557,30 +589,19 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         if waiting:
             _edit("Running...", force=True)
 
-        proc = subprocess.Popen(
-            cmd, cwd=WORKING_DIR, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
+        for attempt in range(1, MAX_RETRIES + 1):
+            returncode, result_text, raw_lines, stderr_output = _run_codex_once(cmd, env)
 
-        for line in iter(proc.stdout.readline, ""):
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
+            if _is_busy_error(returncode, stderr_output, raw_lines):
+                delay = min(2 ** attempt, 30)
+                _edit(f"API busy, retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})", force=True)
+                time.sleep(delay)
                 continue
 
-            etype = evt.get("type", "")
+            if result_text.strip():
+                current_text = result_text
+            break
 
-            if etype == "item.completed":
-                item = evt.get("item", {})
-                if item.get("type") == "agent_message":
-                    t = item.get("text", "")
-                    if t.strip():
-                        current_text = t
-
-            _edit(current_text)
-
-        proc.wait()
         _edit(current_text, force=True)
 
         if not current_text.strip():
