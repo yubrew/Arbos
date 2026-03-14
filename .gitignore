@@ -30,6 +30,9 @@ uv.lock
 .DS_Store
 Thumbs.db
 
+# LLM files
+.claude/
+
 # Runtime / state
 .arbos-launch.sh
 .arbos.pid
