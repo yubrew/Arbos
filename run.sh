@@ -146,7 +146,7 @@ printf "\n"
 
 printf "  ${BOLD}Installing tooling${NC}\n\n"
 
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH:/usr/local/bin"
 
 # uv
 if command_exists uv; then
