@@ -32,6 +32,7 @@ Thumbs.db
 
 # LLM files
 .claude/
+thoughts/
 
 # Runtime / state
 .arbos-launch.sh
